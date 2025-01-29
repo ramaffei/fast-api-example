@@ -1,0 +1,130 @@
+version: '3.1'
+
+volumes:
+  mysql_data: {}
+  redis_data: {}
+  opensearch_data: {}
+
+services:
+  db:
+    container_name: MSExample_db
+    image: mysql:8.3.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_ROOT_PASSWORD: test
+      MYSQL_DATABASE: app_db
+    volumes:
+      - mysql_data:/var/lib/mysql
+    ports:
+      - '3306:3306'
+    healthcheck:
+      test: "/usr/bin/mysql --user=root --password=test --execute \"SHOW DATABASES;\""
+      interval: 5s
+      timeout: 10s
+      retries: 10
+
+  redis:
+    image: redis/redis-stack
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: [ "CMD", "redis-cli", "--raw", "incr", "ping" ]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+    ports:
+      - 6379:6379
+      - 8001:8001
+
+  opensearch:
+    image: opensearchproject/opensearch:latest
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: curl -s http://elasticsearch:9200 >/dev/null || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 50
+    environment:
+      - discovery.type=single-node
+      - node.name=opensearch # Name the node that will run in this container
+      - plugins.security.disabled=true"
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=@dC2P-D3M0 # Sets the demo admin user password when using demo configuration, required for OpenSearch 2.12 and later
+    ulimits:
+      memlock:
+        soft: -1 # Set memlock to unlimited (no soft or hard limit)
+        hard: -1
+      nofile:
+        soft: 65536 # Maximum number of open files for the opensearch user - set to at least 65536
+        hard: 65536
+    ports:
+      - 9200:9200 # REST API
+      - 9600:9600 # Performance Analyzer
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:latest
+    ports:
+      - 5601:5601
+    environment:
+      OPENSEARCH_HOSTS: '["https://opensearch:9200"]'
+    depends_on:
+      - opensearch
+
+  app: &appbase
+    container_name: MSExample
+    build: .
+    command: uvicorn --app-dir /workdir/app main:app --reload --lifespan on --host 0.0.0.0 --port 8000
+    volumes:
+      - .:/workdir
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      opensearch:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:--}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:--}
+      AWS_REGION: 'us-east-1'
+      DEBUG: "true"
+      REDIS_HOST: redis
+      ENABLE_OS_LOGGING: 1
+      OPENSEARCH_INDEX: msorders-logger
+      OPENSEARCH_URL: https://opensearch
+
+
+  migrations:
+    container_name: MSExample_migrations
+    <<: *appbase
+    depends_on: {}
+    command: alembic upgrade head
+
+  lint:
+    <<: *appbase
+    container_name: MSExample_lint
+    depends_on: {}
+    command: >
+      bash -c "
+        ruff check app &&
+        ruff format --check app &&
+        isort --check app &&
+        mypy app
+      "
+
+  tests:
+    <<: *appbase
+    depends_on: {}
+    container_name: MSExample_tests
+    command: pytest tests
+
+  debug:
+    <<: *appbase
+    container_name: MSExample_debug
+    command: >
+      bash -c "python -Xfrozen_modules=off -m debugpy --wait-for-client --listen 0.0.0.0:5678 -m uvicorn --app-dir /workdir/app main:app --reload --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+      - "5678:5678"

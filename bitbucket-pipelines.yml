@@ -1,0 +1,168 @@
+image: atlassian/default-image:4
+
+options:
+  docker: true
+  size: 2x
+
+clone:
+  depth: full
+
+definitions:
+  caches:
+    sonar: ~/.sonar/cache # Caching SonarCloud artifacts will speed up your build
+  services:
+    docker:
+      memory: 4096
+  steps:
+    - step: &sentry-new-release
+        caches:
+          - pip
+        name: "Sentry New Release"
+        script:
+          - set +e
+          - pipe: sentryio/sentry-new-release:0.3.0
+            variables:
+              SENTRY_AUTH_TOKEN: $SENTRY_AUTH_TOKEN
+              SENTRY_ORG: $SENTRY_ORG
+              SENTRY_PROJECT: $SENTRY_PROJECT
+              ENVIRONMENT: $BITBUCKET_BRANCH
+              FINALIZE: "true"
+    - step: &run-lint
+        caches:
+          - pip
+        name: "Run Lint"
+        image: docker/compose:1.29.2
+        script:
+          - docker-compose run lint
+    - step: &run-tests
+        caches:
+          - pip
+        name: "Run Tests"
+        image: docker/compose:1.29.2
+        script:
+          - docker-compose run --name tests_container tests
+        after-script:
+          - mkdir test-reports
+          - docker cp tests_container:/workdir/tests/test-reports/ .
+        artifacts:
+          - test-reports/**
+    - step: &security-check
+        name: "Security check"
+        script:
+          - pipe: aquasecurity/trivy-pipe:1.0.0
+            variables:
+              scanType: fs
+              scanRef: .
+              format: "table"
+              exitCode: "1"
+              ignoreUnfixed: "true"
+              severity: "CRITICAL"
+              output: "security-fs-report-critical.txt"
+              TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,aquasec/trivy-db,ghcr.io/aquasecurity/trivy-db
+              TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db,aquasec/trivy-java-db,ghcr.io/aquasecurity/trivy-java-db
+        artifacts:
+          - "security-fs-report-critical.txt"
+    - step: &build
+        name: Build container image
+        services:
+          - docker
+        script:
+          - docker build -f cicd/container/Dockerfile.ms -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME:$BITBUCKET_COMMIT .
+          - docker save -o image.tar $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME:$BITBUCKET_COMMIT
+        artifacts:
+          - image.tar
+    - step: &security-image-scan
+        name: "Security image scan"
+        services:
+          - docker
+        script:
+          - docker load -i image.tar
+          - pipe: aquasecurity/trivy-pipe:1.0.0
+            variables:
+              scanType: image
+              imageRef: $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME:$BITBUCKET_COMMIT
+              format: "table"
+              exitCode: "1"
+              ignoreUnfixed: "true"
+              severity: "CRITICAL"
+              output: "security-image-report-critical.txt"
+              TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db,aquasec/trivy-db,ghcr.io/aquasecurity/trivy-db
+              TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db,aquasec/trivy-java-db,ghcr.io/aquasecurity/trivy-java-db
+        artifacts:
+          - "security-image-report-critical.txt"
+          - image.tar
+    - step: &push-image-to-ecr
+        name: "Push image to ECR"
+        oidc: true
+        services:
+          - docker
+        script:
+          - docker load -i image.tar
+          - apt-get update -y > /dev/null 2>&1
+          - apt-get install python3 python3-pip jq -y > /dev/null 2>&1
+          - pip3 install boto3 awscli
+          - aws sts assume-role-with-web-identity --role-arn "arn:aws:iam::$AWS_ACCOUNT_ID:role/Bitbucket-AdcapSistemas" --role-session-name "build-session" --web-identity-token $BITBUCKET_STEP_OIDC_TOKEN > credentials.json
+          - export AWS_ACCESS_KEY_ID=$(cat credentials.json | jq -r '.Credentials.AccessKeyId')
+          - export AWS_SECRET_ACCESS_KEY=$(cat credentials.json | jq -r '.Credentials.SecretAccessKey')
+          - export AWS_SESSION_TOKEN=$(cat credentials.json | jq -r '.Credentials.SessionToken')
+          - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+          - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME:$BITBUCKET_COMMIT
+    - step: &deploy
+        name: Deploy
+        script:
+          - apt-get update -y > /dev/null 2>&1
+          - apt-get install python3 python3-pip -y > /dev/null 2>&1
+          - pip3 install pyyaml pydantic
+          - git clone $K8S_REPOSITORY
+          - export IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$REPO_NAME:$BITBUCKET_COMMIT"
+          - python3 cliente-externo-k8s/tools/update-manifests.py -p $PROJECT_MANIFESTS_SUBPATH -k deployment -e $ENVIRONMENT --resource-name $RESOURCE_NAME --container-name $CONTAINER_NAME --image $IMAGE_URI --release-version $BITBUCKET_COMMIT
+          - cd cliente-externo-k8s/
+          - git config user.email $K8S_EMAIL
+          - git add . && git commit -m "Deploy of $REPO_NAME on environment $ENVIRONMENT"
+          - git push
+
+pipelines:
+  pull-requests:
+    "**":
+      - step: *run-lint
+      - step: *run-tests
+      - step: *security-check
+
+  
+  branches:
+    DEV:
+      - stage:
+          name: Build and Deploy to DEV
+          deployment: DEV
+          steps:
+            - step: *run-lint
+            - step: *run-tests
+            - step: *security-check
+            - step: *build
+            - step: *security-image-scan
+            - step: *push-image-to-ecr
+            - step: *deploy
+    STG:
+      - stage:
+          name: Build and Deploy to STG
+          deployment: STG
+          steps:
+            - step: *run-lint
+            - step: *run-tests
+            - step: *security-check
+            - step: *build
+            - step: *security-image-scan
+            - step: *push-image-to-ecr
+            - step: *deploy
+    PRD:
+      - stage:
+          name: Build and Deploy to PRD
+          deployment: PRD
+          steps:
+            - step: *run-lint
+            - step: *run-tests
+            - step: *security-check
+            - step: *build
+            - step: *security-image-scan
+            - step: *push-image-to-ecr
+            - step: *deploy

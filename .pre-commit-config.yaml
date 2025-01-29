@@ -1,0 +1,44 @@
+files: ^app/|^alembic/versions/|^tests/
+default_language_version:
+  python: python3.11
+repos:
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.27.0
+    hooks:
+      - id: commitizen
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.4.8
+    hooks:
+      - id: ruff
+        name: Ruff linter
+        args: ["--fix"]
+      - id: ruff-format
+        name: Ruff formatter
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: "v1.10.0"
+    hooks:
+      - id: mypy
+        exclude: ^alembic/|^tests/
+        additional_dependencies:
+          [
+            pydantic==2.8.2,
+            SQLAlchemy==2.0.31,
+            types-requests==2.32.0.20240602,
+            types-redis==4.6.0.20240425,
+          ]
+  - repo: local
+    hooks:
+      - id: bump-version
+        name: Bump Version
+        entry: bash -c 'bump2version patch --allow-dirty && git add .bumpversion.cfg pyproject.toml app/settings/project_settings.py'
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages:
+          - pre-commit
